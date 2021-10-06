@@ -1,4 +1,4 @@
-// Copyright 2019-2020 Parity Technologies (UK) Ltd.
+// Copyright 2019-2021 Parity Technologies (UK) Ltd.
 // This file is part of substrate-subxt.
 //
 // subxt is free software: you can redistribute it and/or modify
@@ -15,9 +15,9 @@
 // along with substrate-subxt.  If not, see <http://www.gnu.org/licenses/>.
 
 //! Session support
-use crate::frame::system::{
-    System,
-    SystemEventsDecoder as _,
+use crate::frame::{
+    balances::Balances,
+    system::System,
 };
 use codec::Encode;
 use frame_support::Parameter;
@@ -45,9 +45,18 @@ macro_rules! default_impl {
     };
 }
 
+type IdentificationTuple<T> = (
+    <T as Session>::ValidatorId,
+    pallet_staking::Exposure<<T as System>::AccountId, <T as Balances>::Balance>,
+);
+
 /// The trait needed for this module.
 #[module]
-pub trait Session: System {
+pub trait Session: System + Balances {
+    #![event_alias(IdentificationTuple = IdentificationTuple<T>)]
+    #![event_alias(OpaqueTimeSlot = Vec<u8>)]
+    #![event_alias(SessionIndex = u32)]
+
     /// The validator account identifier type for the runtime.
     type ValidatorId: Parameter + Debug + Ord + Default + Send + Sync + 'static;
 
@@ -61,6 +70,22 @@ pub struct ValidatorsStore<T: Session> {
     #[store(returns = Vec<<T as Session>::ValidatorId>)]
     /// Marker for the runtime
     pub _runtime: PhantomData<T>,
+}
+
+/// The queued keys for the next session.
+#[derive(Encode, Store, Debug)]
+pub struct QueuedKeysStore<T: Session> {
+    #[store(returns = Vec<(<T as Session>::ValidatorId, T::Keys)>)]
+    /// Marker for the runtime
+    pub _runtime: PhantomData<T>,
+}
+
+/// The next session keys for a validator.
+#[derive(Encode, Store, Debug)]
+pub struct NextKeysStore<'a, T: Session> {
+    #[store(returns = Option<<T as Session>::Keys>)]
+    /// The validator account.
+    pub validator_id: &'a <T as Session>::ValidatorId,
 }
 
 default_impl!(ValidatorsStore);

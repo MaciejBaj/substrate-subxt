@@ -1,4 +1,4 @@
-// Copyright 2019-2020 Parity Technologies (UK) Ltd.
+// Copyright 2019-2021 Parity Technologies (UK) Ltd.
 // This file is part of substrate-subxt.
 //
 // subxt is free software: you can redistribute it and/or modify
@@ -15,7 +15,6 @@
 // along with substrate-subxt.  If not, see <http://www.gnu.org/licenses/>.
 
 use codec::Encode;
-use pallet_im_online::sr25519::AuthorityId as ImOnlineId;
 use sp_runtime::{
     generic::Header,
     impl_opaque_keys,
@@ -32,32 +31,64 @@ use sp_std::prelude::*;
 /// BABE marker struct
 #[derive(Copy, Clone, Debug, Default, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub struct Babe;
+
+/// Application specific crypto types
+///
+/// # Note
+///
+/// These are redefined here to avoid dependencies on the substrate creates where they are defined.
+/// They must be identical to the definitions in the target substrate version.
+pub mod app {
+    use sp_application_crypto::{
+        app_crypto,
+        ed25519,
+        key_types,
+        sr25519,
+    };
+
+    /// Authority discovery app crypto types
+    pub mod authority_discovery {
+        use super::*;
+        app_crypto!(sr25519, key_types::AUTHORITY_DISCOVERY);
+    }
+    /// Babe app crypto types
+    pub mod babe {
+        use super::*;
+        app_crypto!(sr25519, key_types::BABE);
+    }
+    /// Im online discovery app crypto types
+    pub mod im_online {
+        use super::*;
+        app_crypto!(ed25519, key_types::IM_ONLINE);
+    }
+    /// Grandpa app crypto types
+    pub mod grandpa {
+        use super::*;
+        app_crypto!(ed25519, key_types::GRANDPA);
+    }
+    /// Validator app crypto types
+    pub mod validator {
+        use super::*;
+        app_crypto!(ed25519, sp_core::crypto::KeyTypeId(*b"para"));
+    }
+}
+
 impl sp_runtime::BoundToRuntimeAppPublic for Babe {
-    type Public = sp_consensus_babe::AuthorityId;
+    type Public = app::babe::Public;
 }
 
 /// ImOnline marker struct
 #[derive(Copy, Clone, Debug, Default, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub struct ImOnline;
 impl sp_runtime::BoundToRuntimeAppPublic for ImOnline {
-    type Public = ImOnlineId;
+    type Public = app::im_online::Public;
 }
 
 /// GRANDPA marker struct
 #[derive(Copy, Clone, Debug, Default, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub struct Grandpa;
 impl sp_runtime::BoundToRuntimeAppPublic for Grandpa {
-    type Public = sp_finality_grandpa::AuthorityId;
-}
-
-use sp_authority_discovery::AuthorityId as AuthorityDiscoveryId;
-
-mod validator_app {
-    use application_crypto::{
-        app_crypto,
-        sr25519,
-    };
-    app_crypto!(sr25519, sp_core::crypto::KeyTypeId(*b"para"));
+    type Public = app::grandpa::Public;
 }
 
 /// Parachain marker struct
@@ -65,14 +96,14 @@ mod validator_app {
 pub struct Parachains;
 
 impl sp_runtime::BoundToRuntimeAppPublic for Parachains {
-    type Public = validator_app::Public;
+    type Public = app::validator::Public;
 }
 
 /// Authority discovery marker struct
 #[derive(Copy, Clone, Debug, Default, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub struct AuthorityDiscovery;
 impl sp_runtime::BoundToRuntimeAppPublic for AuthorityDiscovery {
-    type Public = AuthorityDiscoveryId;
+    type Public = app::authority_discovery::Public;
 }
 
 impl_opaque_keys! {
@@ -116,15 +147,32 @@ use crate::{
         balances::{
             AccountData,
             Balances,
+            BalancesEventTypeRegistry,
         },
-        contracts::Contracts,
+        contracts::{
+            Contracts,
+            ContractsEventTypeRegistry,
+        },
         contracts_gateway::ContractsGateway,
         runtime_gateway::RuntimeGateway,
-        session::Session,
-        staking::Staking,
-        sudo::Sudo,
-        system::System,
+        session::{
+            Session,
+            SessionEventTypeRegistry,
+        },
+        staking::{
+            Staking,
+            StakingEventTypeRegistry,
+        },
+        sudo::{
+            Sudo,
+            SudoEventTypeRegistry,
+        },
+        system::{
+            System,
+            SystemEventTypeRegistry,
+        },
     },
+    EventTypeRegistry,
 };
 
 /// Runtime trait.
@@ -133,6 +181,9 @@ pub trait Runtime: System + Sized + Send + Sync + 'static {
     type Signature: Verify + Encode + Send + Sync + 'static;
     /// Transaction extras.
     type Extra: SignedExtra<Self> + Send + Sync + 'static;
+
+    /// Register type sizes for this runtime
+    fn register_type_sizes(event_type_registry: &mut EventTypeRegistry<Self>);
 }
 
 /// Concrete type definitions compatible with those in the default substrate `node_runtime`
@@ -149,6 +200,16 @@ impl Staking for DefaultNodeRuntime {}
 impl Runtime for DefaultNodeRuntime {
     type Signature = MultiSignature;
     type Extra = DefaultExtra<Self>;
+
+    fn register_type_sizes(event_type_registry: &mut EventTypeRegistry<Self>) {
+        event_type_registry.with_system();
+        event_type_registry.with_balances();
+        event_type_registry.with_session();
+        event_type_registry.with_staking();
+        event_type_registry.with_contracts();
+        event_type_registry.with_sudo();
+        register_default_type_sizes(event_type_registry);
+    }
 }
 
 impl System for DefaultNodeRuntime {
@@ -157,7 +218,7 @@ impl System for DefaultNodeRuntime {
     type Hash = sp_core::H256;
     type Hashing = BlakeTwo256;
     type AccountId = <<MultiSignature as Verify>::Signer as IdentifyAccount>::AccountId;
-    type Address = pallet_indices::address::Address<Self::AccountId, u32>;
+    type Address = sp_runtime::MultiAddress<Self::AccountId, u32>;
     type Header = Header<Self::BlockNumber, BlakeTwo256>;
     type Extrinsic = OpaqueExtrinsic;
     type AccountData = AccountData<<Self as Balances>::Balance>;
@@ -192,6 +253,14 @@ pub struct NodeTemplateRuntime;
 impl Runtime for NodeTemplateRuntime {
     type Signature = MultiSignature;
     type Extra = DefaultExtra<Self>;
+
+    fn register_type_sizes(event_type_registry: &mut EventTypeRegistry<Self>) {
+        event_type_registry.with_system();
+        event_type_registry.with_balances();
+        event_type_registry.with_session();
+        event_type_registry.with_sudo();
+        register_default_type_sizes(event_type_registry);
+    }
 }
 
 impl System for NodeTemplateRuntime {
@@ -200,7 +269,7 @@ impl System for NodeTemplateRuntime {
     type Hash = sp_core::H256;
     type Hashing = BlakeTwo256;
     type AccountId = <<MultiSignature as Verify>::Signer as IdentifyAccount>::AccountId;
-    type Address = Self::AccountId;
+    type Address = sp_runtime::MultiAddress<Self::AccountId, u32>;
     type Header = Header<Self::BlockNumber, BlakeTwo256>;
     type Extrinsic = OpaqueExtrinsic;
     type AccountData = AccountData<<Self as Balances>::Balance>;
@@ -228,6 +297,14 @@ pub struct ContractsTemplateRuntime;
 impl Runtime for ContractsTemplateRuntime {
     type Signature = <NodeTemplateRuntime as Runtime>::Signature;
     type Extra = DefaultExtra<Self>;
+
+    fn register_type_sizes(event_type_registry: &mut EventTypeRegistry<Self>) {
+        event_type_registry.with_system();
+        event_type_registry.with_balances();
+        event_type_registry.with_contracts();
+        event_type_registry.with_sudo();
+        register_default_type_sizes(event_type_registry);
+    }
 }
 
 impl System for ContractsTemplateRuntime {
@@ -266,6 +343,14 @@ pub struct KusamaRuntime;
 impl Runtime for KusamaRuntime {
     type Signature = MultiSignature;
     type Extra = DefaultExtra<Self>;
+
+    fn register_type_sizes(event_type_registry: &mut EventTypeRegistry<Self>) {
+        event_type_registry.with_system();
+        event_type_registry.with_balances();
+        event_type_registry.with_session();
+        event_type_registry.with_staking();
+        register_default_type_sizes(event_type_registry);
+    }
 }
 
 impl System for KusamaRuntime {
@@ -289,4 +374,93 @@ impl Staking for KusamaRuntime {}
 
 impl Balances for KusamaRuntime {
     type Balance = u128;
+}
+
+/// Identity of a Grandpa authority.
+pub type AuthorityId = crate::runtimes::app::grandpa::Public;
+/// The weight of an authority.
+pub type AuthorityWeight = u64;
+/// A list of Grandpa authorities with associated weights.
+pub type AuthorityList = Vec<(AuthorityId, AuthorityWeight)>;
+
+/// Register default common runtime type sizes
+pub fn register_default_type_sizes<T: Runtime>(
+    event_type_registry: &mut EventTypeRegistry<T>,
+) {
+    // for types which have all variants with no data, the size is just the index byte.
+    type CLikeEnum = u8;
+
+    // primitives
+    event_type_registry.register_type_size::<bool>("bool");
+    event_type_registry.register_type_size::<u8>("u8");
+    event_type_registry.register_type_size::<u16>("u16");
+    event_type_registry.register_type_size::<u32>("u32");
+    event_type_registry.register_type_size::<u64>("u64");
+    event_type_registry.register_type_size::<u128>("u128");
+
+    event_type_registry.register_type_size::<()>("PhantomData");
+    event_type_registry
+        .register_type_size::<()>("sp_std::marker::PhantomData<(AccountId, Event)>");
+
+    // frame_support types
+    event_type_registry
+        .register_type_size::<frame_support::dispatch::DispatchInfo>("DispatchInfo");
+    event_type_registry
+        .register_type_size::<frame_support::dispatch::DispatchResult>("DispatchResult");
+    event_type_registry
+        .register_type_size::<frame_support::dispatch::DispatchError>("DispatchError");
+    event_type_registry
+        .register_type_size::<frame_support::traits::BalanceStatus>("Status");
+
+    // aliases etc.
+    event_type_registry.register_type_size::<u32>("ReferendumIndex");
+    event_type_registry.register_type_size::<[u8; 16]>("Kind");
+
+    event_type_registry.register_type_size::<u32>("AccountIndex");
+    event_type_registry.register_type_size::<u32>("AssetId");
+    event_type_registry.register_type_size::<u32>("BountyIndex");
+    event_type_registry.register_type_size::<(u8, u8)>("CallIndex");
+    event_type_registry.register_type_size::<[u8; 32]>("CallHash");
+    event_type_registry.register_type_size::<u32>("PropIndex");
+    event_type_registry.register_type_size::<u32>("ProposalIndex");
+    event_type_registry.register_type_size::<CLikeEnum>("ProxyType");
+    event_type_registry.register_type_size::<u32>("AuthorityIndex");
+    event_type_registry.register_type_size::<u32>("MemberCount");
+    event_type_registry.register_type_size::<u32>("RegistrarIndex");
+
+    event_type_registry.register_type_size::<u8>("VoteThreshold");
+    event_type_registry
+        .register_type_size::<(T::BlockNumber, u32)>("TaskAddress<BlockNumber>");
+    event_type_registry
+        .register_type_size::<(T::BlockNumber, u32)>("Timepoint<BlockNumber>");
+
+    event_type_registry.register_type_size::<AuthorityId>("AuthorityId");
+    event_type_registry.register_type_size::<AuthorityWeight>("AuthorityWeight");
+    event_type_registry
+        .register_type_size::<Vec<(AuthorityId, AuthorityWeight)>>("AuthorityList");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn can_register_default_runtime_type_sizes() {
+        EventTypeRegistry::<DefaultNodeRuntime>::new();
+    }
+
+    #[test]
+    fn can_register_node_template_runtime_type_sizes() {
+        EventTypeRegistry::<NodeTemplateRuntime>::new();
+    }
+
+    #[test]
+    fn can_register_contracts_template_runtime_type_sizes() {
+        EventTypeRegistry::<ContractsTemplateRuntime>::new();
+    }
+
+    #[test]
+    fn can_register_kusama_runtime_type_sizes() {
+        EventTypeRegistry::<KusamaRuntime>::new();
+    }
 }

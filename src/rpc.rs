@@ -1,4 +1,4 @@
-// Copyright 2019-2020 Parity Technologies (UK) Ltd.
+// Copyright 2019-2021 Parity Technologies (UK) Ltd.
 // This file is part of substrate-subxt.
 //
 // subxt is free software: you can redistribute it and/or modify
@@ -19,6 +19,8 @@
 // Related: https://github.com/paritytech/substrate-subxt/issues/66
 #![allow(irrefutable_let_patterns)]
 
+use std::sync::Arc;
+
 use codec::{
     Decode,
     Encode,
@@ -29,23 +31,29 @@ use core::{
     marker::PhantomData,
 };
 use frame_metadata::RuntimeMetadataPrefixed;
-use jsonrpsee::{
-    client::Subscription,
-    common::{
-        to_value as to_json_value,
-        Params,
+use jsonrpsee_http_client::HttpClient;
+use jsonrpsee_types::{
+    to_json_value,
+    traits::{
+        Client,
+        SubscriptionClient,
     },
-    Client,
+    DeserializeOwned,
+    Error as RpcError,
+    JsonValue,
+    Subscription,
 };
-use sc_rpc_api::state::ReadProof;
-use serde::Serialize;
+use jsonrpsee_ws_client::WsClient;
+use serde::{
+    Deserialize,
+    Serialize,
+};
 use sp_core::{
     storage::{
         StorageChangeSet,
         StorageData,
         StorageKey,
     },
-    twox_128,
     Bytes,
 };
 use sp_rpc::{
@@ -59,7 +67,6 @@ use sp_runtime::{
     },
     traits::Hash,
 };
-use sp_transaction_pool::TransactionStatus;
 use sp_version::RuntimeVersion;
 
 use crate::{
@@ -74,7 +81,12 @@ use crate::{
     },
     metadata::Metadata,
     runtimes::Runtime,
-    subscription::EventSubscription,
+    subscription::{
+        EventStorageSubscription,
+        EventSubscription,
+        FinalizedEventStorageSubscription,
+        SystemEvents,
+    },
 };
 
 pub type ChainBlock<T> =
@@ -96,9 +108,9 @@ impl From<u32> for BlockNumber {
     }
 }
 
-#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq, Default)]
-#[serde(rename_all = "camelCase")]
 /// System properties for a Substrate-based runtime
+#[derive(serde::Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase")]
 pub struct SystemProperties {
     /// The address format
     pub ss58_format: u8,
@@ -108,10 +120,160 @@ pub struct SystemProperties {
     pub token_symbol: String,
 }
 
+/// Possible transaction status events.
+///
+/// # Note
+///
+/// This is copied from `sp-transaction-pool` to avoid a dependency on that crate. Therefore it
+/// must be kept compatible with that type from the target substrate version.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum TransactionStatus<Hash, BlockHash> {
+    /// Transaction is part of the future queue.
+    Future,
+    /// Transaction is part of the ready queue.
+    Ready,
+    /// The transaction has been broadcast to the given peers.
+    Broadcast(Vec<String>),
+    /// Transaction has been included in block with given hash.
+    InBlock(BlockHash),
+    /// The block this transaction was included in has been retracted.
+    Retracted(BlockHash),
+    /// Maximum number of finality watchers has been reached,
+    /// old watchers are being removed.
+    FinalityTimeout(BlockHash),
+    /// Transaction has been finalized by a finality-gadget, e.g GRANDPA
+    Finalized(BlockHash),
+    /// Transaction has been replaced in the pool, by another transaction
+    /// that provides the same tags. (e.g. same (sender, nonce)).
+    Usurped(Hash),
+    /// Transaction has been dropped from the pool because of the limit.
+    Dropped,
+    /// Transaction is no longer valid in the current state.
+    Invalid,
+}
+
+#[cfg(feature = "client")]
+use substrate_subxt_client::SubxtClient;
+
+/// Rpc client wrapper.
+/// This is workaround because adding generic types causes the macros to fail.
+#[derive(Clone)]
+pub enum RpcClient {
+    /// JSONRPC client WebSocket transport.
+    WebSocket(Arc<WsClient>),
+    /// JSONRPC client HTTP transport.
+    // NOTE: Arc because `HttpClient` is not clone.
+    Http(Arc<HttpClient>),
+    #[cfg(feature = "client")]
+    /// Embedded substrate node.
+    Subxt(SubxtClient),
+}
+
+impl RpcClient {
+    /// Start a JSON-RPC request.
+    pub async fn request<'a, T: DeserializeOwned + std::fmt::Debug>(
+        &self,
+        method: &str,
+        params: &[JsonValue],
+    ) -> Result<T, Error> {
+        let params = params.into();
+        let data = match self {
+            Self::WebSocket(inner) => {
+                inner.request(method, params).await.map_err(Into::into)
+            }
+            Self::Http(inner) => inner.request(method, params).await.map_err(Into::into),
+            #[cfg(feature = "client")]
+            Self::Subxt(inner) => inner.request(method, params).await.map_err(Into::into),
+        };
+        log::debug!("{}: {:?}", method, data);
+        data
+    }
+
+    /// Start a JSON-RPC Subscription.
+    pub async fn subscribe<'a, T: DeserializeOwned>(
+        &self,
+        subscribe_method: &str,
+        params: &[JsonValue],
+        unsubscribe_method: &str,
+    ) -> Result<Subscription<T>, Error> {
+        let params = params.into();
+        match self {
+            Self::WebSocket(inner) => {
+                inner
+                    .subscribe(subscribe_method, params, unsubscribe_method)
+                    .await
+                    .map_err(Into::into)
+            }
+            Self::Http(_) => {
+                Err(RpcError::Custom(
+                    "Subscriptions not supported on HTTP transport".to_owned(),
+                )
+                .into())
+            }
+            #[cfg(feature = "client")]
+            Self::Subxt(inner) => {
+                inner
+                    .subscribe(subscribe_method, params, unsubscribe_method)
+                    .await
+                    .map_err(Into::into)
+            }
+        }
+    }
+}
+
+impl From<WsClient> for RpcClient {
+    fn from(client: WsClient) -> Self {
+        RpcClient::WebSocket(Arc::new(client))
+    }
+}
+
+impl From<Arc<WsClient>> for RpcClient {
+    fn from(client: Arc<WsClient>) -> Self {
+        RpcClient::WebSocket(client)
+    }
+}
+
+impl From<HttpClient> for RpcClient {
+    fn from(client: HttpClient) -> Self {
+        RpcClient::Http(Arc::new(client))
+    }
+}
+
+impl From<Arc<HttpClient>> for RpcClient {
+    fn from(client: Arc<HttpClient>) -> Self {
+        RpcClient::Http(client)
+    }
+}
+
+#[cfg(feature = "client")]
+impl From<SubxtClient> for RpcClient {
+    fn from(client: SubxtClient) -> Self {
+        RpcClient::Subxt(client)
+    }
+}
+
+/// ReadProof struct returned by the RPC
+///
+/// # Note
+///
+/// This is copied from `sc-rpc-api` to avoid a dependency on that crate. Therefore it
+/// must be kept compatible with that type from the target substrate version.
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReadProof<Hash> {
+    /// Block hash used to generate the proof
+    pub at: Hash,
+    /// A proof used to prove that storage entries are included in the storage trie
+    pub proof: Vec<Bytes>,
+}
+
 /// Client for substrate rpc interfaces
 pub struct Rpc<T: Runtime> {
-    client: Client,
+    /// Rpc client for sending requests.
+    pub client: RpcClient,
     marker: PhantomData<T>,
+    accept_weak_inclusion: bool,
 }
 
 impl<T: Runtime> Clone for Rpc<T> {
@@ -119,16 +281,24 @@ impl<T: Runtime> Clone for Rpc<T> {
         Self {
             client: self.client.clone(),
             marker: PhantomData,
+            accept_weak_inclusion: self.accept_weak_inclusion,
         }
     }
 }
 
 impl<T: Runtime> Rpc<T> {
-    pub fn new(client: Client) -> Self {
+    pub fn new(client: RpcClient) -> Self {
         Self {
             client,
             marker: PhantomData,
+            accept_weak_inclusion: false,
         }
+    }
+
+    /// Configure the Rpc to accept non-finalized blocks
+    /// in `submit_and_watch_extrinsic`
+    pub fn accept_weak_inclusion(&mut self) {
+        self.accept_weak_inclusion = true;
     }
 
     /// Fetch a storage key
@@ -137,9 +307,8 @@ impl<T: Runtime> Rpc<T> {
         key: &StorageKey,
         hash: Option<T::Hash>,
     ) -> Result<Option<StorageData>, Error> {
-        let params = Params::Array(vec![to_json_value(key)?, to_json_value(hash)?]);
+        let params = &[to_json_value(key)?, to_json_value(hash)?];
         let data = self.client.request("state_getStorage", params).await?;
-        log::debug!("state_getStorage {:?}", data);
         Ok(data)
     }
 
@@ -153,14 +322,13 @@ impl<T: Runtime> Rpc<T> {
         start_key: Option<StorageKey>,
         hash: Option<T::Hash>,
     ) -> Result<Vec<StorageKey>, Error> {
-        let params = Params::Array(vec![
+        let params = &[
             to_json_value(prefix)?,
             to_json_value(count)?,
             to_json_value(start_key)?,
             to_json_value(hash)?,
-        ]);
+        ];
         let data = self.client.request("state_getKeysPaged", params).await?;
-        log::debug!("state_getKeysPaged {:?}", data);
         Ok(data)
     }
 
@@ -171,11 +339,11 @@ impl<T: Runtime> Rpc<T> {
         from: T::Hash,
         to: Option<T::Hash>,
     ) -> Result<Vec<StorageChangeSet<<T as System>::Hash>>, Error> {
-        let params = Params::Array(vec![
+        let params = &[
             to_json_value(keys)?,
             to_json_value(from)?,
             to_json_value(to)?,
-        ]);
+        ];
         self.client
             .request("state_queryStorage", params)
             .await
@@ -188,9 +356,9 @@ impl<T: Runtime> Rpc<T> {
         keys: &[StorageKey],
         at: Option<T::Hash>,
     ) -> Result<Vec<StorageChangeSet<<T as System>::Hash>>, Error> {
-        let params = Params::Array(vec![to_json_value(keys)?, to_json_value(at)?]);
+        let params = &[to_json_value(keys)?, to_json_value(at)?];
         self.client
-            .request("state_queryStorage", params)
+            .request("state_queryStorageAt", params)
             .await
             .map_err(Into::into)
     }
@@ -198,7 +366,7 @@ impl<T: Runtime> Rpc<T> {
     /// Fetch the genesis hash
     pub async fn genesis_hash(&self) -> Result<T::Hash, Error> {
         let block_zero = Some(ListOrValue::Value(NumberOrHex::Number(0)));
-        let params = Params::Array(vec![to_json_value(block_zero)?]);
+        let params = &[to_json_value(block_zero)?];
         let list_or_value: ListOrValue<Option<T::Hash>> =
             self.client.request("chain_getBlockHash", params).await?;
         match list_or_value {
@@ -211,10 +379,7 @@ impl<T: Runtime> Rpc<T> {
 
     /// Fetch the metadata
     pub async fn metadata(&self) -> Result<Metadata, Error> {
-        let bytes: Bytes = self
-            .client
-            .request("state_getMetadata", Params::None)
-            .await?;
+        let bytes: Bytes = self.client.request("state_getMetadata", &[]).await?;
         let meta: RuntimeMetadataPrefixed = Decode::decode(&mut &bytes[..])?;
         let metadata: Metadata = meta.try_into()?;
         Ok(metadata)
@@ -222,10 +387,7 @@ impl<T: Runtime> Rpc<T> {
 
     /// Fetch system properties
     pub async fn system_properties(&self) -> Result<SystemProperties, Error> {
-        Ok(self
-            .client
-            .request("system_properties", Params::None)
-            .await?)
+        Ok(self.client.request("system_properties", &[]).await?)
     }
 
     /// Get a header
@@ -233,7 +395,7 @@ impl<T: Runtime> Rpc<T> {
         &self,
         hash: Option<T::Hash>,
     ) -> Result<Option<T::Header>, Error> {
-        let params = Params::Array(vec![to_json_value(hash)?]);
+        let params = &[to_json_value(hash)?];
         let header = self.client.request("chain_getHeader", params).await?;
         Ok(header)
     }
@@ -244,7 +406,7 @@ impl<T: Runtime> Rpc<T> {
         block_number: Option<BlockNumber>,
     ) -> Result<Option<T::Hash>, Error> {
         let block_number = block_number.map(ListOrValue::Value);
-        let params = Params::Array(vec![to_json_value(block_number)?]);
+        let params = &[to_json_value(block_number)?];
         let list_or_value = self.client.request("chain_getBlockHash", params).await?;
         match list_or_value {
             ListOrValue::Value(hash) => Ok(hash),
@@ -254,10 +416,7 @@ impl<T: Runtime> Rpc<T> {
 
     /// Get a block hash of the latest finalized block
     pub async fn finalized_head(&self) -> Result<T::Hash, Error> {
-        let hash = self
-            .client
-            .request("chain_getFinalizedHead", Params::None)
-            .await?;
+        let hash = self.client.request("chain_getFinalizedHead", &[]).await?;
         Ok(hash)
     }
 
@@ -266,7 +425,7 @@ impl<T: Runtime> Rpc<T> {
         &self,
         hash: Option<T::Hash>,
     ) -> Result<Option<ChainBlock<T>>, Error> {
-        let params = Params::Array(vec![to_json_value(hash)?]);
+        let params = &[to_json_value(hash)?];
         let block = self.client.request("chain_getBlock", params).await?;
         Ok(block)
     }
@@ -277,7 +436,7 @@ impl<T: Runtime> Rpc<T> {
         keys: Vec<StorageKey>,
         hash: Option<T::Hash>,
     ) -> Result<ReadProof<T::Hash>, Error> {
-        let params = Params::Array(vec![to_json_value(keys)?, to_json_value(hash)?]);
+        let params = &[to_json_value(keys)?, to_json_value(hash)?];
         let proof = self.client.request("state_getReadProof", params).await?;
         Ok(proof)
     }
@@ -287,7 +446,7 @@ impl<T: Runtime> Rpc<T> {
         &self,
         at: Option<T::Hash>,
     ) -> Result<RuntimeVersion, Error> {
-        let params = Params::Array(vec![to_json_value(at)?]);
+        let params = &[to_json_value(at)?];
         let version = self
             .client
             .request("state_getRuntimeVersion", params)
@@ -295,33 +454,38 @@ impl<T: Runtime> Rpc<T> {
         Ok(version)
     }
 
-    /// Subscribe to substrate System Events
-    pub async fn subscribe_events(
-        &self,
-    ) -> Result<Subscription<StorageChangeSet<T::Hash>>, Error> {
-        let mut storage_key = twox_128(b"System").to_vec();
-        storage_key.extend(twox_128(b"Events").to_vec());
-        log::debug!("Events storage key {:?}", hex::encode(&storage_key));
-
-        let keys = Some(vec![StorageKey(storage_key)]);
-        let params = Params::Array(vec![to_json_value(keys)?]);
+    /// Subscribe to System Events that are imported into blocks.
+    ///
+    /// *WARNING* these may not be included in the finalized chain, use
+    /// `subscribe_finalized_events` to ensure events are finalized.
+    pub async fn subscribe_events(&self) -> Result<EventStorageSubscription<T>, Error> {
+        let keys = Some(vec![StorageKey::from(SystemEvents::new())]);
+        let params = &[to_json_value(keys)?];
 
         let subscription = self
             .client
             .subscribe("state_subscribeStorage", params, "state_unsubscribeStorage")
             .await?;
-        Ok(subscription)
+        Ok(EventStorageSubscription::Imported(subscription))
+    }
+
+    /// Subscribe to finalized events.
+    pub async fn subscribe_finalized_events(
+        &self,
+    ) -> Result<EventStorageSubscription<T>, Error> {
+        Ok(EventStorageSubscription::Finalized(
+            FinalizedEventStorageSubscription::new(
+                self.clone(),
+                self.subscribe_finalized_blocks().await?,
+            ),
+        ))
     }
 
     /// Subscribe to blocks.
     pub async fn subscribe_blocks(&self) -> Result<Subscription<T::Header>, Error> {
         let subscription = self
             .client
-            .subscribe(
-                "chain_subscribeNewHeads",
-                Params::None,
-                "chain_subscribeNewHeads",
-            )
+            .subscribe("chain_subscribeNewHeads", &[], "chain_unsubscribeNewHeads")
             .await?;
 
         Ok(subscription)
@@ -335,8 +499,8 @@ impl<T: Runtime> Rpc<T> {
             .client
             .subscribe(
                 "chain_subscribeFinalizedHeads",
-                Params::None,
-                "chain_subscribeFinalizedHeads",
+                &[],
+                "chain_unsubscribeFinalizedHeads",
             )
             .await?;
         Ok(subscription)
@@ -348,7 +512,7 @@ impl<T: Runtime> Rpc<T> {
         extrinsic: E,
     ) -> Result<T::Hash, Error> {
         let bytes: Bytes = extrinsic.encode().into();
-        let params = Params::Array(vec![to_json_value(bytes)?]);
+        let params = &[to_json_value(bytes)?];
         let xt_hash = self
             .client
             .request("author_submitExtrinsic", params)
@@ -361,7 +525,7 @@ impl<T: Runtime> Rpc<T> {
         extrinsic: E,
     ) -> Result<Subscription<TransactionStatus<T::Hash, T::Hash>>, Error> {
         let bytes: Bytes = extrinsic.encode().into();
-        let params = Params::Array(vec![to_json_value(bytes)?]);
+        let params = &[to_json_value(bytes)?];
         let subscription = self
             .client
             .subscribe(
@@ -374,18 +538,22 @@ impl<T: Runtime> Rpc<T> {
     }
 
     /// Create and submit an extrinsic and return corresponding Event if successful
-    pub async fn submit_and_watch_extrinsic<E: Encode + 'static>(
+    pub async fn submit_and_watch_extrinsic<'a, E: Encode + 'static>(
         &self,
         extrinsic: E,
-        decoder: EventsDecoder<T>,
+        decoder: &'a EventsDecoder<T>,
     ) -> Result<ExtrinsicSuccess<T>, Error> {
         let ext_hash = T::Hashing::hash_of(&extrinsic);
         log::info!("Submitting Extrinsic `{:?}`", ext_hash);
 
-        let events_sub = self.subscribe_events().await?;
+        let events_sub = if self.accept_weak_inclusion {
+            self.subscribe_events().await
+        } else {
+            self.subscribe_finalized_events().await
+        }?;
         let mut xt_sub = self.watch_extrinsic(extrinsic).await?;
 
-        while let status = xt_sub.next().await {
+        while let Ok(Some(status)) = xt_sub.next().await {
             log::info!("received status {:?}", status);
             match status {
                 // ignore in progress extrinsic for now
@@ -393,45 +561,12 @@ impl<T: Runtime> Rpc<T> {
                 | TransactionStatus::Ready
                 | TransactionStatus::Broadcast(_) => continue,
                 TransactionStatus::InBlock(block_hash) => {
-                    log::info!("Fetching block {:?}", block_hash);
-                    let block = self.block(Some(block_hash)).await?;
-                    return match block {
-                        Some(signed_block) => {
-                            log::info!(
-                                "Found block {:?}, with {} extrinsics",
-                                block_hash,
-                                signed_block.block.extrinsics.len()
-                            );
-                            let ext_index = signed_block
-                                .block
-                                .extrinsics
-                                .iter()
-                                .position(|ext| {
-                                    let hash = T::Hashing::hash_of(ext);
-                                    hash == ext_hash
-                                })
-                                .ok_or_else(|| {
-                                    Error::Other(format!(
-                                        "Failed to find Extrinsic with hash {:?}",
-                                        ext_hash,
-                                    ))
-                                })?;
-                            let mut sub = EventSubscription::new(events_sub, decoder);
-                            sub.filter_extrinsic(block_hash, ext_index);
-                            let mut events = vec![];
-                            while let Some(event) = sub.next().await {
-                                events.push(event?);
-                            }
-                            Ok(ExtrinsicSuccess {
-                                block: block_hash,
-                                extrinsic: ext_hash,
-                                events,
-                            })
-                        }
-                        None => {
-                            Err(format!("Failed to find block {:?}", block_hash).into())
-                        }
+                    if self.accept_weak_inclusion {
+                        return self
+                            .process_block(events_sub, decoder, block_hash, ext_hash)
+                            .await
                     }
+                    continue
                 }
                 TransactionStatus::Invalid => return Err("Extrinsic Invalid".into()),
                 TransactionStatus::Usurped(_) => return Err("Extrinsic Usurped".into()),
@@ -439,16 +574,62 @@ impl<T: Runtime> Rpc<T> {
                 TransactionStatus::Retracted(_) => {
                     return Err("Extrinsic Retracted".into())
                 }
-                // should have made it `InBlock` before either of these
-                TransactionStatus::Finalized(_) => {
-                    return Err("Extrinsic Finalized".into())
+                TransactionStatus::Finalized(block_hash) => {
+                    // read finalized blocks by default
+                    return self
+                        .process_block(events_sub, decoder, block_hash, ext_hash)
+                        .await
                 }
                 TransactionStatus::FinalityTimeout(_) => {
                     return Err("Extrinsic FinalityTimeout".into())
                 }
             }
         }
-        unreachable!()
+        Err(RpcError::Custom("RPC subscription dropped".into()).into())
+    }
+
+    async fn process_block<'a>(
+        &self,
+        events_sub: EventStorageSubscription<T>,
+        decoder: &'a EventsDecoder<T>,
+        block_hash: T::Hash,
+        ext_hash: T::Hash,
+    ) -> Result<ExtrinsicSuccess<T>, Error> {
+        log::info!("Fetching block {:?}", block_hash);
+        if let Some(signed_block) = self.block(Some(block_hash)).await? {
+            log::info!(
+                "Found block {:?}, with {} extrinsics",
+                block_hash,
+                signed_block.block.extrinsics.len()
+            );
+            let ext_index = signed_block
+                .block
+                .extrinsics
+                .iter()
+                .position(|ext| {
+                    let hash = T::Hashing::hash_of(ext);
+                    hash == ext_hash
+                })
+                .ok_or_else(|| {
+                    Error::Other(format!(
+                        "Failed to find Extrinsic with hash {:?}",
+                        ext_hash,
+                    ))
+                })?;
+            let mut sub = EventSubscription::new(events_sub, decoder);
+            sub.filter_extrinsic(block_hash, ext_index);
+            let mut events = vec![];
+            while let Some(event) = sub.next().await {
+                events.push(event?);
+            }
+            Ok(ExtrinsicSuccess {
+                block: block_hash,
+                extrinsic: ext_hash,
+                events,
+            })
+        } else {
+            Err(format!("Failed to find block {:?}", block_hash).into())
+        }
     }
 
     /// Insert a key into the keystore.
@@ -458,21 +639,18 @@ impl<T: Runtime> Rpc<T> {
         suri: String,
         public: Bytes,
     ) -> Result<(), Error> {
-        let params = Params::Array(vec![
+        let params = &[
             to_json_value(key_type)?,
             to_json_value(suri)?,
             to_json_value(public)?,
-        ]);
+        ];
         self.client.request("author_insertKey", params).await?;
         Ok(())
     }
 
     /// Generate new session keys and returns the corresponding public keys.
     pub async fn rotate_keys(&self) -> Result<Bytes, Error> {
-        Ok(self
-            .client
-            .request("author_rotateKeys", Params::None)
-            .await?)
+        Ok(self.client.request("author_rotateKeys", &[]).await?)
     }
 
     /// Checks if the keystore has private keys for the given session public keys.
@@ -481,7 +659,7 @@ impl<T: Runtime> Rpc<T> {
     ///
     /// Returns `true` iff all private keys could be found.
     pub async fn has_session_keys(&self, session_keys: Bytes) -> Result<bool, Error> {
-        let params = Params::Array(vec![to_json_value(session_keys)?]);
+        let params = &[to_json_value(session_keys)?];
         Ok(self.client.request("author_hasSessionKeys", params).await?)
     }
 
@@ -493,8 +671,7 @@ impl<T: Runtime> Rpc<T> {
         public_key: Bytes,
         key_type: String,
     ) -> Result<bool, Error> {
-        let params =
-            Params::Array(vec![to_json_value(public_key)?, to_json_value(key_type)?]);
+        let params = &[to_json_value(public_key)?, to_json_value(key_type)?];
         Ok(self.client.request("author_hasKey", params).await?)
     }
 }
